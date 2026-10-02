@@ -1,0 +1,104 @@
+name: Release
+
+# Publishing is driven by the version in pyproject.toml: push a commit to main
+# that bumps it and this ships, otherwise it does nothing. There is no tag to
+# remember, and re-running on an already-published version is a no-op rather
+# than a failed upload.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Never publish two versions concurrently, and never cancel an upload midway.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Is this version new?
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      should_publish: ${{ steps.check.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Read the version from pyproject.toml
+        id: read
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "pyproject declares $version"
+
+      - name: Compare against what PyPI already has
+        id: check
+        env:
+          VERSION: ${{ steps.read.outputs.version }}
+        run: |
+          # A 200 means this version is already on PyPI. Uploads are immutable,
+          # so re-publishing it would fail; skip instead of going red on every
+          # push that does not bump the version.
+          if curl -sfo /dev/null "https://pypi.org/pypi/webmage/${VERSION}/json"; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::webmage ${VERSION} is already on PyPI. Nothing to publish."
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::webmage ${VERSION} is new. It will publish once CI passes."
+          fi
+
+  # Runs on every push to main, not only publishing ones, so main is always
+  # verified. Only the publish job below is gated on the version being new.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish to PyPI
+    needs: [version, ci]
+    if: needs.version.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+
+    # Scopes the OIDC credential. The name must match the Environment field of
+    # the publisher registered on PyPI.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/webmage
+
+    permissions:
+      # Lets the runner mint the short-lived OIDC token PyPI exchanges for an
+      # upload token. This is the whole reason no API token is stored anywhere.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Build
+        run: |
+          pip install build twine
+          python -m build
+
+      - name: Verify the distribution
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          twine check --strict dist/*
+          # Guard against a stale build directory producing files for some
+          # other version than the one we checked against PyPI.
+          test -f "dist/webmage-${VERSION}.tar.gz"
+          test -f "dist/webmage-${VERSION}-py3-none-any.whl"
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

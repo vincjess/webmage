@@ -26,6 +26,28 @@ installing only one of Playwright or Selenium runs that half. Install both
 before opening a pull request — the point of the suite is proving the two
 engines behave identically, and half of it cannot show that.
 
+## Releasing
+
+The version in `pyproject.toml` is the release trigger. To ship:
+
+1. Bump `version` in `pyproject.toml`.
+2. Move the `CHANGELOG.md` entry from unreleased to the new version and date.
+3. Merge to `main`.
+
+`.github/workflows/release.yml` compares that version against PyPI. If it is
+already published it does nothing; if it is new it runs the full suite and, only
+on green, publishes.
+
+Uploads use PyPI Trusted Publishing over OIDC, so there is no API token stored
+in the repository. PyPI checks that the request comes from this repository's
+`release.yml` running in the `pypi` environment, and issues a short-lived token.
+Changing the workflow filename or the environment name means updating the
+publisher entry on PyPI to match, or uploads will be rejected.
+
+PyPI uploads are immutable: a version number cannot be reused, even after a
+delete. A botched release is fixed by bumping to the next patch version, never
+by re-publishing.
+
 ## Adding an engine
 
 Implement `Backend` and `ElementAdapter` from `webmage/backends/base.py`, then

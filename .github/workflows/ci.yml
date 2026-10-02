@@ -1,10 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
+  # Pushes to main come through release.yml, which calls this workflow and then
+  # decides whether to publish. Triggering on main here as well would run every
+  # check twice for the same commit.
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
