@@ -1,6 +1,79 @@
 [build-system]
-requires = [
-"setuptools>=42",
-"wheel"
-]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "webmage"
+version = "2.0.0"
+description = "One readable API over Playwright and Selenium for scraping dynamically loading pages."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jesse Vincent", email = "javascriptorian@gmail.com" }]
+keywords = ["scraping", "selenium", "playwright", "browser", "automation", "crawler"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
+]
+
+# No hard driver dependency: install the engine you actually want. 1.0.x
+# required selenium, webdriver_manager, beautifulsoup4 and
+# undetected_chromedriver, and imported none of the last three.
+dependencies = []
+
+[project.optional-dependencies]
+playwright = ["playwright>=1.40"]
+selenium = ["selenium>=4.11"]
+all = ["playwright>=1.40", "selenium>=4.11"]
+dev = [
+    "playwright>=1.40",
+    "selenium>=4.11",
+    "pytest>=7.4",
+    "mypy>=1.8",
+    "ruff>=0.3",
+    "build>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/vincjess/webmage"
+Repository = "https://github.com/vincjess/webmage"
+Changelog = "https://github.com/vincjess/webmage/blob/main/CHANGELOG.md"
+Issues = "https://github.com/vincjess/webmage/issues"
+
+[tool.setuptools.packages.find]
+include = ["webmage*"]
+
+[tool.setuptools.package-data]
+webmage = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "browser: needs a real browser; skipped when the engine is unavailable",
+]
+
+[tool.ruff]
+line-length = 90
+target-version = "py310"
+# Code blocks in the docs are illustrative and hand-aligned for reading; let
+# them be, and keep ruff on the actual source.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = false
+ignore_missing_imports = true

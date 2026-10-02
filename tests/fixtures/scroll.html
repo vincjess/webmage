@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>Scrolling</title>
+  <style>
+    body { margin: 0; }
+    .block { height: 400px; border-bottom: 1px solid #ccc; }
+    #box { height: 300px; overflow-y: scroll; border: 2px solid #333; }
+    #box .block { height: 250px; }
+  </style>
+</head>
+<body>
+  <!-- Grows as you approach the bottom, so infinite_scroll has to notice the
+       page getting taller and then stop when it stops. -->
+  <div id="page"></div>
+  <div id="box"><div class="block">box 1</div></div>
+  <script>
+    var added = 0;
+    function grow(host, cap) {
+      var el = document.createElement('div');
+      el.className = 'block';
+      el.textContent = 'block ' + (++added);
+      host.appendChild(el);
+    }
+    var page = document.getElementById('page');
+    for (var i = 0; i < 3; i++) { grow(page); }
+
+    var rounds = 0;
+    window.addEventListener('scroll', function () {
+      var atBottom = window.innerHeight + window.scrollY >= document.body.offsetHeight - 50;
+      if (atBottom && rounds < 3) { rounds++; grow(page); }
+    });
+
+    var box = document.getElementById('box');
+    for (var j = 0; j < 4; j++) {
+      var el = document.createElement('div');
+      el.className = 'block';
+      el.textContent = 'box ' + (j + 2);
+      box.appendChild(el);
+    }
+  </script>
+</body>
+</html>

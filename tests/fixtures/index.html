@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>WebMage Test Page</title></head>
+<body>
+  <h1 id="title">Hello WebMage</h1>
+
+  <nav>
+    <a href="/one" data-kind="internal">One</a>
+    <a href="/two" data-kind="internal">Two</a>
+    <a href="https://example.com" data-kind="external">Three</a>
+  </nav>
+
+  <ul id="items">
+    <li class="item" data-id="1">Alpha</li>
+    <li class="item" data-id="2">Beta</li>
+    <li class="item" data-id="3">Gamma</li>
+  </ul>
+
+  <!-- An apostrophe in the attribute: a selector targeting this used to break
+       destroy()/destroy_all(), which pasted the selector into JS source. -->
+  <p id="quoted" data-label="it's here">Quoted</p>
+
+  <div id="log"></div>
+  <button class="tally" onclick="log('a')">A</button>
+  <button class="tally" onclick="log('b')">B</button>
+  <button class="tally" onclick="log('c')">C</button>
+
+  <input id="name" type="text" value="preset">
+
+  <p id="doomed">Remove me</p>
+  <div id="removables">
+    <span class="gone">1</span><span class="gone">2</span><span class="gone">3</span>
+  </div>
+
+  <div id="later"></div>
+
+  <iframe id="frame" src="inner.html" width="300" height="100"></iframe>
+
+  <img id="pixel" width="40" height="40"
+       src="data:image/gif;base64,R0lGODlhAQABAIAAAP8AAAAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==">
+
+  <script>
+    function log(ch) { document.getElementById('log').textContent += ch; }
+    // Appears late, so wait_for has something real to wait on.
+    setTimeout(function () {
+      document.getElementById('later').innerHTML = '<b id="late">arrived</b>';
+    }, 300);
+  </script>
+</body>
+</html>

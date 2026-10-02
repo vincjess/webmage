@@ -1,304 +1,380 @@
-import re
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.common.by import By
+"""The browser session: WebMage's main entry point."""
+
+from __future__ import annotations
+
+import sys
+from collections.abc import Callable
 from time import sleep
-from selenium.common.exceptions import JavascriptException
-import json
-# Runes
-from .rune_list import RuneList
+from types import TracebackType
+from typing import Any
+from urllib.parse import urlparse
+
+from .backends import Backend, create_backend
+from .exceptions import ElementNotFoundError
 from .rune import Rune
+from .rune_list import RuneList
+
+__all__ = ["Spell"]
+
+# Reading scrollHeight and setting scrollTop both need to resolve the scrolling
+# element first. The selector arrives as an argument rather than being pasted
+# into the source, so a selector containing a quote cannot break the script.
+_SCROLL_HEIGHT_JS = """
+var el = arguments[0] ? document.querySelector(arguments[0]) : document.scrollingElement;
+if (!el) { return null; }
+return el.scrollHeight;
+"""
+
+_SCROLL_TO_JS = """
+var el = arguments[0] ? document.querySelector(arguments[0]) : document.scrollingElement;
+if (!el) { return null; }
+el.scrollTop = arguments[1] === null ? el.scrollHeight : arguments[1];
+return el.scrollHeight;
+"""
+
+ScrollCallback = Callable[["Spell"], Any]
+
 
 class Spell:
-    def __init__(self, url, driver_path=None, ghost=False, browser='chrome'):
-        self.url = url
-        self.driver_path = driver_path
-        self.ghost = ghost
-        self.browser = browser
+    """A live browser session.
 
-        self.initialize_driver()
+    Build one with :func:`webmage.WebMage` rather than directly::
 
+        with WebMage("https://example.com", headless=True) as spell:
+            print(spell.select("h1").text)
 
-    def initialize_driver(self):
-        # Get chrome driver if no path is given.
-        if self.driver_path == None:
-            if 'chrome' in self.browser:
-                options = webdriver.ChromeOptions()
-                if self.ghost:
-                    options.add_argument('--headless')
-                # Remove all of the nonsense errors that are printed out.
-                options.add_argument('--ignore-certificate-errors')
-                options.add_argument('--ignore-ssl-errors')
-                service = ChromeService()
-                self.driver = webdriver.Chrome(service=service, options=options)
-            elif self.browser == 'firefox':
-                options = webdriver.FirefoxOptions()
-                if self.ghost:
-                    options.add_argument('--headless')
-                # Remove all of the nonsense errors that are printed out.
-                options.add_argument('--ignore-certificate-errors')
-                options.add_argument('--ignore-ssl-errors')
-                service = FirefoxService()
-                self.driver = webdriver.Firefox(service=service, options=options)
+    Used as a context manager the browser always closes, including on an
+    exception, which is the usual source of leaked browser processes.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        engine: str = "playwright",
+        browser: str = "chromium",
+        headless: bool = False,
+        driver_path: str | None = None,
+        capture_network: bool = False,
+    ) -> None:
+        self._backend: Backend = create_backend(
+            engine,
+            browser=browser,
+            headless=headless,
+            driver_path=driver_path,
+            capture_network=capture_network,
+        )
+        # Resolved, not requested: with engine="auto" the caller still gets to
+        # see which engine actually started.
+        self.engine = self._backend.name
+        self.browser = self._backend.browser  # type: ignore[attr-defined]
+        self._backend.goto(url)
+
+    # -- context manager --------------------------------------------------
+
+    def __enter__(self) -> Spell:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def __repr__(self) -> str:
+        return f"<Spell {self.engine}/{self.browser} on {self.url}>"
+
+    # -- page state -------------------------------------------------------
+
+    @property
+    def url(self) -> str:
+        """The URL currently loaded."""
+        return self._backend.current_url
+
+    @property
+    def title(self) -> str:
+        return self._backend.title
+
+    def get_page_source(self) -> str:
+        return self._backend.page_source
+
+    def get_slug(self) -> str:
+        """The last path segment of the URL, without query or fragment.
+
+        Parsed with :mod:`urllib.parse` rather than the stack of regexes 1.0.x
+        used, which mangled URLs with no path or with a dot in the query.
+        """
+        path = urlparse(self.url).path.rstrip("/")
+        return path.rsplit("/", 1)[-1] if path else ""
+
+    def change_url(self, url: str, retries: int = 0, retry_delay: float = 3.0) -> None:
+        """Navigate to ``url``, optionally retrying on failure.
+
+        ``retries`` is a finite count. 1.0.x looped forever behind a bare
+        ``except:``, which also swallowed ``KeyboardInterrupt``, so a site that
+        was simply down could not be interrupted with Ctrl-C.
+        """
+        attempts = max(0, retries) + 1
+        last: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                self._backend.goto(url)
+                return
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                last = exc
+                if attempt + 1 < attempts:
+                    self.wait(retry_delay)
+        assert last is not None
+        raise last
+
+    # -- selecting --------------------------------------------------------
+
+    def select(self, css_selector: str) -> Rune | None:
+        """First match, or ``None``."""
+        found = self._backend.find(css_selector)
+        return Rune(found) if found else None
+
+    def select_all(self, css_selector: str) -> RuneList:
+        """Every match, as a :class:`~webmage.rune_list.RuneList`."""
+        return RuneList(Rune(e) for e in self._backend.find_all(css_selector))
+
+    def require(self, css_selector: str) -> Rune:
+        """Like :meth:`select` but raises when nothing matches."""
+        found = self.select(css_selector)
+        if found is None:
+            raise ElementNotFoundError(f"Nothing matched {css_selector!r}.")
+        return found
+
+    def wait_for(
+        self, css_selector: str, timeout: float = 10.0, state: str = "visible"
+    ) -> Rune:
+        """Block until an element is ``attached``, ``visible`` or ``hidden``.
+
+        The reason to prefer this over :meth:`wait`: it returns as soon as the
+        page is ready instead of always sleeping the full interval, and it fails
+        loudly when the element never arrives.
+        """
+        return Rune(self._backend.wait_for(css_selector, timeout, state))
+
+    # -- interaction ------------------------------------------------------
+
+    def click(self, css_selector: str) -> None:
+        self.require(css_selector).click()
+
+    def click_all(self, css_selector: str, wait_interval: float = 0.25) -> None:
+        """Click every match, pausing between clicks.
+
+        1.0.x called ``.click()`` on the *list* returned by ``find_elements``,
+        so this method raised ``AttributeError`` on every call and had never
+        worked.
+        """
+        for rune in self.select_all(css_selector):
+            rune.click()
+            self.wait(wait_interval)
+
+    def type(self, css_selector: str, text: str) -> None:
+        self.require(css_selector).type(text)
+
+    def clear(self, css_selector: str) -> None:
+        self.require(css_selector).clear()
+
+    def get_screenshot(self, css_selector: str) -> bytes:
+        """PNG bytes of one element."""
+        return self.require(css_selector).screenshot()
+
+    # -- scripting --------------------------------------------------------
+
+    def cast_js(self, script: str, *args: Any) -> Any:
+        """Run JavaScript in the page.
+
+        ``script`` is a function body; extra arguments arrive as
+        ``arguments[0]``, ``arguments[1]`` and so on, and ``return`` hands a
+        value back. Identical on both engines.
+        """
+        return self._backend.execute_js(script, *args)
+
+    def destroy(self, css_selector: str) -> None:
+        """Remove the first matching element from the page."""
+        self.cast_js(
+            "var el = document.querySelector(arguments[0]); if (el) { el.remove(); }",
+            css_selector,
+        )
+
+    def destroy_all(self, css_selector: str) -> None:
+        """Remove every matching element from the page."""
+        self.cast_js(
+            "document.querySelectorAll(arguments[0]).forEach(el => el.remove());",
+            css_selector,
+        )
+
+    # -- scrolling --------------------------------------------------------
+
+    def _scroll_height(self, selector: str | None) -> int:
+        height = self.cast_js(_SCROLL_HEIGHT_JS, selector)
+        if height is None:
+            raise ElementNotFoundError(f"No scrolling element matched {selector!r}.")
+        return int(height)
+
+    def _scroll_loop(
+        self,
+        wait_interval: float,
+        selector: str | None,
+        callback: ScrollCallback | None,
+        verbose: bool,
+        max_scrolls: int | None,
+        pixel_step: int | None,
+    ) -> int:
+        """The engine behind all four scroll methods.
+
+        ``pixel_step`` of ``None`` jumps to the bottom each time; an integer
+        advances by that many pixels. ``max_scrolls`` of ``None`` runs until the
+        page stops growing.
+        """
+        count = 0
+        offset = 0
+        last_height = self._scroll_height(selector)
+
+        while max_scrolls is None or count < max_scrolls:
+            if pixel_step is None:
+                target: int | None = None
             else:
-                raise Exception(f'{self.browser} is not a valid browser.')
-        self.driver.get(self.url)
+                offset += pixel_step
+                target = offset
 
-
-    def close(self):
-        self.driver.close()
-
-
-    # For selecting first item based on CSS selector.
-    def select(self, css_selector):
-        elements = self.driver.find_elements(By.CSS_SELECTOR, css_selector)
-        if len(elements) > 0:
-            return Rune(elements[0], self.driver)
-        else:
-            return None
-
-
-    # For selecting first item based on CSS selector.
-    def selectAll(self, css_selector):
-        return RuneList([Rune(i, self.driver)for i in self.driver.find_elements(By.CSS_SELECTOR, css_selector)])
-
-    # Changes the URL of the original soup.
-    def changeUrl(self, url, retry=True):
-        if retry == False:
-            self.driver.get(url)
-            self.url = self.driver.current_url
-        else:
-            success = False
-            while success == False:
-                try:
-                    self.driver.get(url)
-                    self.url = self.driver.current_url
-                    success = True
-                except:
-                    print('Error! Trying in 3 few seconds...')
-                    self.wait(3)
-
-    # Click on a element by its css selector
-    def click(self, css_selector):
-        self.driver.find_element(By.CSS_SELECTOR, css_selector).click()
-
-    # Click on all elements by its css selector. Waits 0.25 between each click by default
-    def clickAll(self, css_selector, wait_interval=0.25):
-        clickable_elements = self.driver.find_elements(By.CSS_SELECTOR, css_selector).click()
-        for el in clickable_elements:
-            el.click()
+            new_height = self.cast_js(_SCROLL_TO_JS, selector, target)
             self.wait(wait_interval)
+            count += 1
 
-    def scroll(self, wait_interval, scroll_count, scroll_css_selector="document.scrollingElement", callback=None, verbose=True):
-        counter = 1
-
-        # Make the CSS Selector into a querySelector
-        if scroll_css_selector != 'document.scrollingElement':
-            scroll_css_selector = f'document.querySelector("{scroll_css_selector}")'
-
-        last_height = self.driver.execute_script(f"return {scroll_css_selector}.scrollHeight")
-
-        while counter <= scroll_count:
-            self.driver.execute_script(f"{scroll_css_selector}.scrollTop = {scroll_css_selector}.scrollHeight;")
-            # Wait to load page
-            self.wait(wait_interval)
             if verbose:
-                print(f'\rScroll #{counter} completed!', end='')
-            counter += 1
-            
-            # Execute callback function
+                print(f"\rScroll #{count} completed!", end="", file=sys.stderr)
             if callback:
                 callback(self)
-            
-            # Calculate new scroll height and compare with last scroll height
-            new_height = self.driver.execute_script(f"return {scroll_css_selector}.scrollHeight")
 
-            if new_height == last_height:
+            new_height = self._scroll_height(selector)
+            if pixel_step is None:
+                # Jump-to-bottom mode: nothing new loaded means we are done.
+                if new_height == last_height:
+                    break
+            elif offset >= new_height:
                 break
             last_height = new_height
-        # Go to next line after scroll completion.
-        print('')
 
+        if verbose and count:
+            print("", file=sys.stderr)
+        return count
 
-    def scrollByPixels(self, wait_interval, scroll_count, scroll_pixel_length=500, scroll_css_selector="document.scrollingElement", callback=None, verbose=True):
-        counter = 1
+    def scroll(
+        self,
+        wait_interval: float,
+        scroll_count: int,
+        selector: str | None = None,
+        callback: ScrollCallback | None = None,
+        verbose: bool = False,
+    ) -> int:
+        """Jump to the bottom up to ``scroll_count`` times.
 
-        # Make the CSS Selector into a querySelector
-        if scroll_css_selector != 'document.scrollingElement':
-            scroll_css_selector = f'document.querySelector("{scroll_css_selector}")'
+        Stops early once the page stops growing. Returns the number of scrolls
+        performed.
+        """
+        return self._scroll_loop(
+            wait_interval, selector, callback, verbose, scroll_count, None
+        )
 
-        # last_height = self.driver.execute_script(f"return {scroll_css_selector}.scrollHeight")
-        max_height = int(self.castJS(f'return {scroll_css_selector}.scrollHeight'))
-        i = 0
+    def scroll_by_pixels(
+        self,
+        wait_interval: float,
+        scroll_count: int,
+        pixels: int = 500,
+        selector: str | None = None,
+        callback: ScrollCallback | None = None,
+        verbose: bool = False,
+    ) -> int:
+        """Advance ``pixels`` at a time, up to ``scroll_count`` times.
 
-        while counter <= scroll_count:
-            self.castJS(f'{scroll_css_selector}.scrollTop = {i}')
-            i += scroll_pixel_length
-            # Wait to load page
-            self.wait(wait_interval)
-            if verbose:
-                print(f'\rScroll #{counter} completed!', end='')
-            counter += 1
-            # Execute callback function
-            if callback:
-                callback(self)
+        Gentler than :meth:`scroll` for pages that only load content for
+        viewports they believe a human has actually passed through.
+        """
+        return self._scroll_loop(
+            wait_interval, selector, callback, verbose, scroll_count, pixels
+        )
 
-            # If page is dynamically adding content to page, max_height will increment.
-            max_height = int(self.castJS(f'return {scroll_css_selector}.scrollHeight'))
+    def infinite_scroll(
+        self,
+        wait_interval: float,
+        selector: str | None = None,
+        callback: ScrollCallback | None = None,
+        verbose: bool = False,
+        max_scrolls: int | None = None,
+    ) -> int:
+        """Jump to the bottom until the page stops growing.
 
-        # Go to next line after scroll completion.
-        print('')
+        ``max_scrolls`` is an optional ceiling; 1.0.x had none, so a page that
+        kept appending content looped forever.
+        """
+        return self._scroll_loop(
+            wait_interval, selector, callback, verbose, max_scrolls, None
+        )
 
+    def infinite_scroll_by_pixels(
+        self,
+        wait_interval: float,
+        pixels: int = 500,
+        selector: str | None = None,
+        callback: ScrollCallback | None = None,
+        verbose: bool = False,
+        max_scrolls: int | None = None,
+    ) -> int:
+        """Advance ``pixels`` at a time until the bottom is reached."""
+        return self._scroll_loop(
+            wait_interval, selector, callback, verbose, max_scrolls, pixels
+        )
 
-    def infiniteScroll(self, wait_interval, scroll_css_selector="document.scrollingElement", callback=None, verbose=True):
-        counter = 1
+    # -- tabs and frames --------------------------------------------------
 
-        # Make the CSS Selector into a querySelector
-        if scroll_css_selector != 'document.scrollingElement':
-            scroll_css_selector = f'document.querySelector("{scroll_css_selector}")'
+    def open_tab(
+        self,
+        url: str,
+        callback: Callable[[Spell, Any], Any] | None = None,
+        payload: Any = None,
+    ) -> Any:
+        """Open ``url`` in a second tab, run ``callback``, then close it.
 
-        last_height = self.driver.execute_script(f"return {scroll_css_selector}.scrollHeight")
-
-        while True:
-            self.driver.execute_script(f"{scroll_css_selector}.scrollTop = {scroll_css_selector}.scrollHeight;")
-            # Wait to load page
-            self.wait(wait_interval)
-            if verbose:
-                print(f'\rScroll #{counter} completed!', end='')
-            counter += 1
-            # Execute callback function
-            if callback:
-                callback(self)
-            # Calculate new scroll height and compare with last scroll height
-            new_height = self.driver.execute_script(f"return {scroll_css_selector}.scrollHeight")
-            # Break if at the bottom of the page.
-            if new_height == last_height:
-                break
-            last_height = new_height
-        # Go to next line after scroll completion.
-        print('')
-
-
-    def infiniteScrollByPixels(self, wait_interval, scroll_pixel_length=500, scroll_css_selector="document.scrollingElement", callback=None, verbose=True):
-        counter = 1
-
-        # Make the CSS Selector into a querySelector
-        if scroll_css_selector != 'document.scrollingElement':
-            scroll_css_selector = f'document.querySelector("{scroll_css_selector}")'
-
-        # last_height = self.driver.execute_script(f"return {scroll_css_selector}.scrollHeight")
-        max_height = int(self.castJS(f'return {scroll_css_selector}.scrollHeight'))
-        i = 0
-
-        while max_height > i:
-            self.castJS(f'{scroll_css_selector}.scrollTop = {i}')
-            i += scroll_pixel_length
-            # Wait to load page
-            self.wait(wait_interval)
-            if verbose:
-                print(f'\rScroll #{counter} completed!', end='')
-            counter += 1
-            # Execute callback function
-            if callback:
-                callback(self)
-
-            # If page is dynamically adding content to page, max_height will increment.
-            max_height = int(self.castJS(f'return {scroll_css_selector}.scrollHeight'))
-
-        # Go to next line after scroll completion.
-        print('')
-
-    # Wait a certain amount of seconds to continue code.
-    def wait(self, time_interval):
-        sleep(time_interval)
-
-    # Gets the end name of the URL
-    def getSlug(self):
-        # Get portion of URL after last forward slash.
-        slug =  re.sub(r'^.+?/([^/]+?)$', r'\1', self.url)
-        # Remove any hashes
-        slug = re.sub(r'#[^#]+?$', r'', slug)
-        # Remove any queries
-        slug = re.sub(r'\?.+?$', r'', slug)
-        return slug
-
-
-
-    def getNetworkLog(self):
-        filtered_entries = []
-        # Get the full performance log
-        logs = self.driver.get_log('performance')
-
-        for entry in logs:
-            # Parse the entry.
-            log = json.loads(entry["message"])["message"]
-            # Filter for only these 3 logs.
-            if (
-                "Network.response" in log["method"]
-                or "Network.request" in log["method"]
-                or "Network.webSocket" in log["method"]
-            ):
-                filtered_entries.append(log)
-        return filtered_entries
-
-
-    def castJS(self, javaScript, arguments=None):
-        return self.driver.execute_script(javaScript, arguments)
-
-
-    def openTab(self, url, callback=False, payload=None):
-        # Open a new tab to the url
-        self.castJS(f"window.open('{url}', '_blank');")
-        # Get list of all tabs (handles)
-        handles = self.driver.window_handles
-        # Make focus on second handle
-        self.driver.switch_to.window(handles[1])
-        # Pause to allow tab to load
-        self.wait(3)
-        # Call the callback with the payload arguments
-        if callback:
-            payload = callback(self, payload)
-
-        # Close the tab
-        self.driver.close()
-        # Switch focus back to main handle
-        self.driver.switch_to.window(handles[0])
-
+        The callback receives ``(spell, payload)`` and whatever it returns comes
+        back from this method. The tab closes even if the callback raises.
+        """
+        self._backend.open_tab(url)
+        try:
+            if callback is not None:
+                payload = callback(self, payload)
+        finally:
+            self._backend.close_tab()
         return payload
 
-    def getScreenshot(self, css_selector):
-        return self.driver.find_element(By.CSS_SELECTOR, css_selector).screenshot_as_png
+    def switch_frames(self, css_selector: str) -> None:
+        """Route subsequent queries into the matching iframe."""
+        self._backend.switch_to_frame(css_selector)
 
-    def clear(self, css_selector):
-        self.driver.find_element(By.CSS_SELECTOR, css_selector).clear()
+    def switch_to_default_content(self) -> None:
+        """Route queries back to the top-level document."""
+        self._backend.switch_to_default_content()
 
-    def type(self, css_selector, string):
-        self.driver.find_element(By.CSS_SELECTOR, css_selector).send_keys(string)
+    # -- misc -------------------------------------------------------------
 
-    def destroy(self, css_selector):
-        try:
-            self.castJS(f"""
-            let els = document.querySelectorAll('{css_selector}');
-            els.length > 0 ? els[0].remove() : null;
-            """)
-        except JavascriptException as err:
-            print('WebMage tried to destroyed an element that does not exist.')
+    def get_network_log(self) -> list[dict[str, Any]]:
+        """Network activity since the last call.
 
-    def destroyAll(self, css_selector):
-        try:
-            self.castJS(f"""
-            document.querySelectorAll('{css_selector}')
-                .forEach(el => el.remove());
-            """)
-        except JavascriptException as err:
-            print('WebMage tried to destroyed an element that does not exist.')
+        Requires ``capture_network=True`` at construction. Each entry is a dict
+        with ``type``, ``url``, ``method``, ``status``, ``resource_type`` and
+        ``headers`` -- the same shape from both engines, where 1.0.x returned
+        raw Chrome DevTools messages.
+        """
+        return self._backend.network_log()
 
-    def switchToDefaultContent(self):
-        self.driver.switch_to.default_content()
+    def wait(self, seconds: float) -> None:
+        """Sleep. Prefer :meth:`wait_for` when waiting on an element."""
+        sleep(seconds)
 
-    def switchFrames(self, css_selector):
-        self.driver.switch_to.frame(self.driver.find_element(By.CSS_SELECTOR, css_selector))
-
-    def getPageSource(self):
-        return self.driver.page_source
+    def close(self) -> None:
+        """Shut the browser down."""
+        self._backend.close()
